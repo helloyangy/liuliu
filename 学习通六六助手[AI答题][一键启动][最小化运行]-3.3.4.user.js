@@ -4,7 +4,7 @@
 // @version      3.3.4
 // @description  学习通专属AI助手，支持一键答题、自动解析，安全稳定。修复未答题界面的多面板Bug，修复判断题与选项提取逻辑，提升日志安全性。
 // @author       You
-// @icon         https://www.chaoxing.com/favicon.ico
+// @icon         data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23d92d27'/%3E%3Cpath d='M18 16h30l-11 10h10L27 48h12L22 32h11L18 16z' fill='%23fff'/%3E%3C/svg%3E
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xueyinonline.com/*
 // @match        *://*.edu.cn/*
@@ -51,6 +51,8 @@
         autoAnalyze: true,
         autoSubmit: false,
         scanIntervalMs: 1200,
+        panelPos: null,
+        launcherPos: null,
         systemPrompt: [
             'You are a study assistant.',
             'Return ONLY a valid JSON object with keys: answer, explanation, confidence.',
@@ -97,6 +99,18 @@
     }
     function normalizeAnswerText(answer) {
         return cleanText(answer).toUpperCase().replace(/\s+/g, '');
+    }
+    function clamp(value, min, max) {
+        return Math.min(Math.max(value, min), max);
+    }
+    function normalizePosition(pos, width, height) {
+        if (!pos || typeof pos.left !== 'number' || typeof pos.top !== 'number') return null;
+        const maxLeft = Math.max(0, window.innerWidth - width);
+        const maxTop = Math.max(0, window.innerHeight - height);
+        return {
+            left: clamp(pos.left, 0, maxLeft),
+            top: clamp(pos.top, 0, maxTop)
+        };
     }
 
     // --- Question type ---
@@ -209,12 +223,15 @@
             const r = el.getBoundingClientRect();
             return r.height > 0 && r.bottom > 0 && r.top < window.innerHeight;
         });
-        if (!visible.length) return null;
         for (const item of visible) {
             const q = parseQuestion(item);
             if (q && !isQuestionAnswered(q)) return item;
         }
-        return visible[0];
+        for (const item of getQuestionBlocks()) {
+            const q = parseQuestion(item);
+            if (q && !isQuestionAnswered(q)) return item;
+        }
+        return null;
     }
 
     function scrollToNextUnanswered() {
@@ -407,29 +424,52 @@
                 ]
             });
 
-            const tid = setTimeout(() => reject(new Error('请求超时')), Number(config.timeoutMs));
+            const timeoutMs = Math.max(1000, Number(config.timeoutMs) || 45000);
+            let settled = false;
+            let req = null;
+            const finish = (fn, value) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(tid);
+                fn(value);
+            };
+            const tid = setTimeout(() => {
+                try { req?.abort?.(); } catch (_) {}
+                finish(reject, new Error('请求超时'));
+            }, timeoutMs + 1000);
 
-            GM_xmlhttpRequest({
+            req = GM_xmlhttpRequest({
                 method: 'POST',
                 url: config.baseUrl.replace(/\/$/, '') + '/chat/completions',
+                timeout: timeoutMs,
                 headers: {
                     'Content-Type': 'application/json',
                     'Authorization': 'Bearer ' + config.apiKey
                 },
                 data: body,
                 onload(resp) {
-                    clearTimeout(tid);
                     try {
+                        if (resp.status < 200 || resp.status >= 300) {
+                            const snippet = cleanText(resp.responseText || '').slice(0, 120);
+                            finish(reject, new Error(`HTTP ${resp.status}${snippet ? `: ${snippet}` : ''}`));
+                            return;
+                        }
                         const data = JSON.parse(resp.responseText);
-                        if (data.error) { reject(new Error(data.error.message || 'API Error')); return; }
+                        if (data.error) {
+                            finish(reject, new Error(data.error.message || 'API Error'));
+                            return;
+                        }
                         const content = data.choices?.[0]?.message?.content || '';
-                        resolve(parseModelJson(content));
+                        finish(resolve, parseModelJson(content));
                     } catch (e) {
-                        reject(new Error('解析 API 响应失败: ' + e.message));
+                        finish(reject, new Error('解析 API 响应失败: ' + e.message));
                     }
                 },
-                onerror() { clearTimeout(tid); reject(new Error('网络请求失败')); },
-                ontimeout() { clearTimeout(tid); reject(new Error('请求超时')); }
+                onerror() { finish(reject, new Error('网络请求失败')); },
+                ontimeout() {
+                    try { req?.abort?.(); } catch (_) {}
+                    finish(reject, new Error('请求超时'));
+                }
             });
         });
     }
@@ -600,6 +640,85 @@
         let appliedAnswers = new Map();
         let isSettingsOpen = false;
         let isMinimized = false;
+        let isProcessingCurrent = false;
+
+        function savePanelPosition() {
+            const rect = panel.getBoundingClientRect();
+            saveConfig({ panelPos: { left: rect.left, top: rect.top } });
+        }
+        function saveLauncherPosition() {
+            const rect = launcher.getBoundingClientRect();
+            saveConfig({ launcherPos: { left: rect.left, top: rect.top } });
+        }
+        function applySavedPositions() {
+            const panelPos = normalizePosition(config.panelPos, 300, 240);
+            if (panelPos) {
+                panel.style.left = `${panelPos.left}px`;
+                panel.style.top = `${panelPos.top}px`;
+                panel.style.right = 'auto';
+            }
+            const launcherPos = normalizePosition(config.launcherPos, 24, 24);
+            if (launcherPos) {
+                launcher.style.left = `${launcherPos.left}px`;
+                launcher.style.top = `${launcherPos.top}px`;
+            }
+        }
+        function setupDraggable(target, options = {}) {
+            const handle = options.handle || target;
+            const onSave = options.onSave || (() => {});
+            let dragging = false;
+            let moved = false;
+            let startX = 0;
+            let startY = 0;
+            let initialLeft = 0;
+            let initialTop = 0;
+            let raf = null;
+
+            handle.addEventListener('mousedown', (e) => {
+                if (options.beforeStart && options.beforeStart(e) === false) return;
+                dragging = true;
+                moved = false;
+                startX = e.clientX;
+                startY = e.clientY;
+                const rect = target.getBoundingClientRect();
+                initialLeft = rect.left;
+                initialTop = rect.top;
+                target.style.right = 'auto';
+                target.style.bottom = 'auto';
+                e.preventDefault();
+            });
+
+            document.addEventListener('mousemove', (e) => {
+                if (!dragging) return;
+                const dx = e.clientX - startX;
+                const dy = e.clientY - startY;
+                if (!moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) moved = true;
+                if (raf) cancelAnimationFrame(raf);
+                raf = requestAnimationFrame(() => {
+                    const width = target.offsetWidth || target.getBoundingClientRect().width;
+                    const height = target.offsetHeight || target.getBoundingClientRect().height;
+                    const left = clamp(initialLeft + dx, 0, Math.max(0, window.innerWidth - width));
+                    const top = clamp(initialTop + dy, 0, Math.max(0, window.innerHeight - height));
+                    target.style.left = `${left}px`;
+                    target.style.top = `${top}px`;
+                });
+            });
+
+            document.addEventListener('mouseup', () => {
+                if (!dragging) return;
+                dragging = false;
+                if (raf) {
+                    cancelAnimationFrame(raf);
+                    raf = null;
+                }
+                if (moved) {
+                    onSave();
+                    window.setTimeout(() => { moved = false; }, 0);
+                }
+            });
+
+            return () => moved;
+        }
 
         function addLog(msg, type = 'info') {
             const row = document.createElement('div');
@@ -620,7 +739,15 @@
         }
 
         function stopAuto() {
-            if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+            if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+        }
+        function nextScanDelay() {
+            return Math.max(300, Number(config.scanIntervalMs) || 1500);
+        }
+        function scheduleNextRun(delay = nextScanDelay()) {
+            stopAuto();
+            if (!config.autoAnalyze) return;
+            autoTimer = setTimeout(runAutoLoop, delay);
         }
         function rememberAppliedAnswer(question, answer) {
             appliedAnswers.set(buildQuestionSignature(question), normalizeAnswerText(answer));
@@ -644,6 +771,7 @@
             if (isMinimized) {
                 panel.style.display = 'none';
                 launcher.style.display = 'flex';
+                savePanelPosition();
                 minimizeBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>`;
             } else {
                 panel.style.display = 'flex';
@@ -665,34 +793,17 @@
             });
         }
 
-        let isDragging = false, startX, startY, initialLeft, initialTop;
-
-        header.addEventListener('mousedown', (e) => {
-            if (e.target.closest('[title]')) return;
-            isDragging = true;
-            startX = e.clientX; startY = e.clientY;
-            const rect = panel.getBoundingClientRect();
-            initialLeft = rect.left; initialTop = rect.top;
-            panel.style.right = 'auto'; panel.style.bottom = 'auto';
-            e.preventDefault();
+        const didDragPanel = setupDraggable(panel, {
+            handle: header,
+            beforeStart(e) {
+                if (e.target.closest('[title]')) return false;
+                return true;
+            },
+            onSave: savePanelPosition
         });
-
-        if (!window._xxtHelperDraggingSetup) {
-            window._xxtHelperDraggingSetup = true;
-            let raf;
-            document.addEventListener('mousemove', (e) => {
-                if (!isDragging) return;
-                cancelAnimationFrame(raf);
-                raf = requestAnimationFrame(() => {
-                    const p = document.getElementById('liuliu-helper-panel');
-                    if (p) {
-                        p.style.left = `${initialLeft + e.clientX - startX}px`;
-                        p.style.top  = `${initialTop  + e.clientY - startY}px`;
-                    }
-                });
-            });
-            document.addEventListener('mouseup', () => { isDragging = false; });
-        }
+        const didDragLauncher = setupDraggable(launcher, {
+            onSave: saveLauncherPosition
+        });
 
         // --- Core processing loop ---
         async function processCurrent() {
@@ -700,6 +811,7 @@
             if (!block) { updateStatus('未检测到未答题目或已做完'); return; }
             const q = parseQuestion(block);
             if (!q || !q.stem) { updateStatus('题目解析失败或内容为空'); return; }
+            if (isQuestionAnswered(q)) { updateStatus('当前题目已作答，继续查找下一题'); return; }
             if (processingQids.has(q.qid)) return;
 
             const signature = buildQuestionSignature(q);
@@ -750,17 +862,32 @@
         }
 
         function startAuto() {
-            stopAuto();
             if (!config.autoAnalyze) return;
             updateStatus('正在运行...', 'success');
-            autoTimer = setInterval(async () => {
-                try { await processCurrent(); } catch (_) {}
-            }, Number(config.scanIntervalMs) || 1500);
+            scheduleNextRun(0);
+        }
+        async function runAutoLoop() {
+            autoTimer = null;
+            if (!config.autoAnalyze || isProcessingCurrent) {
+                if (config.autoAnalyze) scheduleNextRun();
+                return;
+            }
+            isProcessingCurrent = true;
+            try {
+                await processCurrent();
+            } catch (_) {
+            } finally {
+                isProcessingCurrent = false;
+                if (config.autoAnalyze) scheduleNextRun();
+            }
         }
 
         // --- Event listeners ---
         minimizeBtn.addEventListener('click', toggleMinimize);
-        launcher.addEventListener('click', toggleMinimize);
+        launcher.addEventListener('click', () => {
+            if (didDragLauncher()) return;
+            toggleMinimize();
+        });
         settingsBtn.addEventListener('click', toggleSettings);
 
         toggleBtn.addEventListener('click', () => {
@@ -784,6 +911,7 @@
         panel.appendChild(settingsPanel);
         document.body.appendChild(panel);
         document.body.appendChild(launcher);
+        applySavedPositions();
 
         if (config.autoAnalyze) startAuto();
         else updateStatus('已暂停，点击按钮启动');
