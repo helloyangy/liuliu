@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通六六助手
 // @namespace    xuexitong-liuliu-helper
-// @version      3.3.5
+// @version      3.3.6
 // @description  学习通专属AI助手，支持一键答题、自动解析，安全稳定。修复未答题界面的多面板Bug，修复判断题与选项提取逻辑，提升日志安全性。
 // @author       You
 // @icon         data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23d92d27'/%3E%3Cpath d='M18 16h30l-11 10h10L27 48h12L22 32h11L18 16z' fill='%23fff'/%3E%3C/svg%3E
@@ -30,7 +30,13 @@
 
     class LRUCache {
         constructor(max = 200) { this.max = max; this.cache = new Map(); }
-        get(key) { return this.cache.get(key); }
+        get(key) {
+            const val = this.cache.get(key);
+            if (val === undefined && !this.cache.has(key)) return undefined;
+            this.cache.delete(key);
+            this.cache.set(key, val);
+            return val;
+        }
         has(key) { return this.cache.has(key); }
         set(key, val) {
             if (this.cache.size >= this.max) this.cache.delete(this.cache.keys().next().value);
@@ -473,18 +479,52 @@
             }))
         });
     }
+    function stripControlChars(s) {
+        return s.replace(/[\x00-\x1f]/g, ' ').replace(/ {2,}/g, ' ');
+    }
+    function fixLooseJson(s) {
+        // 修复未加引号的值，如 "answer": D → "answer": "D"
+        return s.replace(
+            /([{,]\s*"(?:answer|explanation|confidence)")\s*:\s*(?!["{\[\dtfn-])(.*?)(?=\s*[,}])/gi,
+            function (_, prefix, val) {
+                val = val.trim();
+                if (!val) return prefix + ': ""';
+                return prefix + ': "' + val.replace(/"/g, '\\"') + '"';
+            }
+        );
+    }
+    function regexExtract(s) {
+        // 最终兜底：用正则从畸形文本中提取 answer 字段
+        const answerMatch = s.match(/["']?answer["']?\s*[:=]\s*["']?([^"',}\n]+)/i);
+        const explMatch = s.match(/["']?explanation["']?\s*[:=]\s*["']([^"']*)/i);
+        const confMatch = s.match(/["']?confidence["']?\s*[:=]\s*([\d.]+)/i);
+        if (!answerMatch) return null;
+        return {
+            answer: answerMatch[1].trim(),
+            explanation: explMatch ? explMatch[1].trim() : '',
+            confidence: confMatch ? parseFloat(confMatch[1]) : 0
+        };
+    }
     function parseModelJson(content) {
         const text = String(content || '').trim();
         if (!text) throw new Error('API 返回内容为空');
-        const unwrapped = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-        try {
-            return JSON.parse(unwrapped);
-        } catch (_) {}
+        const unwrapped = stripControlChars(
+            text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim()
+        );
+        // 1. 直接尝试解析
+        try { return JSON.parse(unwrapped); } catch (_) {}
+        // 2. 提取 {} 部分再尝试
         const start = unwrapped.indexOf('{');
         const end = unwrapped.lastIndexOf('}');
         if (start >= 0 && end > start) {
-            return JSON.parse(unwrapped.slice(start, end + 1));
+            const jsonSlice = unwrapped.slice(start, end + 1);
+            try { return JSON.parse(jsonSlice); } catch (_) {}
+            // 3. 修复未加引号的值后再尝试
+            try { return JSON.parse(fixLooseJson(jsonSlice)); } catch (_) {}
         }
+        // 4. 正则兜底提取
+        const extracted = regexExtract(unwrapped);
+        if (extracted) return extracted;
         throw new Error('模型返回不是有效 JSON');
     }
     function buildUserMessageContent(question) {
@@ -578,7 +618,11 @@
                 try {
                     const doc = iframe.contentDocument || iframe.contentWindow.document;
                     if (doc?.body) {
-                        doc.body.innerHTML = formattedAnswer;
+                        const safeHtml = formattedAnswer
+                            .replace(/<br\s*\/?>/gi, '\x00BR\x00')
+                            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                            .replace(/\x00BR\x00/g, '<br/>');
+                        doc.body.innerHTML = safeHtml;
                         filled = true;
                     }
                 } catch (_) {}
@@ -612,6 +656,7 @@
         const re = /(?:^|[\s\n,;；，])(\d+)\s*[\.\):：、）]?\s*([\s\S]*?)(?=(?:[\s\n,;；，]+\d+\s*[\.\):：、）]?\s*)|$)/g;
         let match;
         while ((match = re.exec(text))) {
+            if (match[0].length === 0) { re.lastIndex++; if (re.lastIndex > text.length) break; continue; }
             numbered.push({
                 index: Number(match[1]),
                 value: cleanText(match[2]).replace(/^[-=]+|[-=]+$/g, '').trim()
@@ -817,10 +862,11 @@
         if (question.type === 'judge') {
             let want = '';
             const ansUpper = answer.toUpperCase();
-            // 【Bug修复 1】增加边界控制，防止类似 "The statement is false" 命中 T，被判成“对”
-            if (/(对|正确|是)/.test(answer) || /\b(YES|TRUE|T)\b/i.test(answer) || ansUpper === 'A') {
+            // 【Bug修复 1】增加边界控制，排除”是否/能否”等复合词干扰，”是””否”仅精确匹配
+            const judgeClean = answer.replace(/是否|能否|可否|与否/g, '').trim();
+            if (/(对|正确)/.test(judgeClean) || /^是$/.test(judgeClean) || /\b(YES|TRUE|T)\b/i.test(answer) || ansUpper === 'A') {
                 want = '对';
-            } else if (/(错|错误|否)/.test(answer) || /\b(NO|FALSE|F)\b/i.test(answer) || ansUpper === 'B') {
+            } else if (/(错|错误)/.test(judgeClean) || /^否$/.test(judgeClean) || /\b(NO|FALSE|F)\b/i.test(answer) || ansUpper === 'B') {
                 want = '错';
             }
 
@@ -838,13 +884,13 @@
             return want;
         }
 
-        // 【Bug修复 2】单/多选答案字母提取策略：优先提取独立的大写字母组合，退化处理只留 A-F
-        let match = answer.match(/\b[A-F]+\b/i);
+        // 【Bug修复 2】单/多选答案字母提取策略：提取所有独立的大写字母，合并去重排序
+        const allLetterMatches = answer.match(/\b[A-F]\b/gi);
         let letters = '';
-        if (match) {
-            letters = match[0].toUpperCase();
+        if (allLetterMatches) {
+            letters = [...new Set(allLetterMatches.map(c => c.toUpperCase()))].sort().join('');
         } else {
-            // 只保留A-F，避免提取出 THE 等长句里包含的不相干字母
+            // 退化处理：只保留A-F，避免提取出 THE 等长句里包含的不相干字母
             letters = answer.toUpperCase().replace(/[^A-F]/g, '');
         }
 
@@ -1502,16 +1548,22 @@
             }, delay);
         });
     }
-    function scheduleFullPageReload(delay = 900) {
+    function scheduleFullPageReload(delay = 2000) {
         const host = getSharedHostWindow();
         if (host !== window) return;
         if (reloadTimer) host.clearTimeout(reloadTimer);
-        reloadTimer = host.setTimeout(() => {
+        const reloadCheck = () => {
+            const active = document.activeElement;
+            if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
+                reloadTimer = host.setTimeout(reloadCheck, 2000);
+                return;
+            }
             try {
                 releasePanelOwner();
             } catch (_) {}
             host.location.reload();
-        }, delay);
+        };
+        reloadTimer = host.setTimeout(reloadCheck, delay);
     }
     function hookTeacherAjax() {
         const host = getSharedHostWindow();
@@ -1550,8 +1602,10 @@
         }
 
         if (!uiObserver && document.body) {
+            let mutDebounce = null;
             uiObserver = new MutationObserver(() => {
-                ensureUI();
+                if (mutDebounce) clearTimeout(mutDebounce);
+                mutDebounce = setTimeout(ensureUI, 300);
             });
             uiObserver.observe(document.body, { childList: true, subtree: true });
         }
@@ -1560,7 +1614,7 @@
     if (typeof GM_registerMenuCommand === 'function') {
         // 提供在无题目界面（如首页）强制唤出配置面板的方法
         GM_registerMenuCommand('⚙️ 强制显示设置面板 (仅主网页有效)', () => {
-            if (!hasQuestionBlocks()) return;
+            if (!hasQuestionBlocks()) { alert('当前页面未检测到题目，无法显示面板'); return; }
             if (!hasMountedPanel()) uiMounted = false;
             if (!isCurrentWindowPanelOwner() && !claimPanelOwner()) return;
             if (!uiMounted || !hasMountedPanel()) {
