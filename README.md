@@ -11,7 +11,12 @@
 
 ## 文件
 
-- `学习通六六助手[AI答题][一键启动][最小化运行]-3.3.7.user.js`: 主脚本
+- `学习通六六助手.user.js`: 主脚本
+
+## Releases
+
+- 当前发布版本：`3.3.7`
+- 已配置 GitHub Actions `Release` 工作流，可对已有 tag `v3.3.7` 手动发布 GitHub Release
 
 ## 使用
 
