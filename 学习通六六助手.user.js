@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通六六助手
 // @namespace    xuexitong-liuliu-helper
-// @version      3.3.6
-// @description  学习通专属AI助手，支持一键答题、自动解析，安全稳定。修复未答题界面的多面板Bug，修复判断题与选项提取逻辑，提升日志安全性。
+// @version      3.3.7
+// @description  学习通专属AI助手，支持一键答题、自动解析，安全稳定。修复填空题答案识别与多空回填问题，增强简答题和数组答案兼容性。
 // @author       You
 // @icon         data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23d92d27'/%3E%3Cpath d='M18 16h30l-11 10h10L27 48h12L22 32h11L18 16z' fill='%23fff'/%3E%3C/svg%3E
 // @match        *://*.chaoxing.com/*
@@ -96,6 +96,15 @@
     function cleanText(v) {
         return String(v || '').replace(/\u00a0/g, ' ').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
     }
+    function answerToPlainText(answer, joiner = '\n') {
+        if (Array.isArray(answer)) {
+            return answer
+                .map(item => String(item ?? '').trim())
+                .join(joiner)
+                .trim();
+        }
+        return String(answer ?? '').trim();
+    }
     function trimStemPrefix(stem) {
         return cleanText(stem)
             .replace(/^\d+[.、]\s*/, '')
@@ -108,7 +117,7 @@
         return t.length > len ? t.slice(0, len) + '...' : t;
     }
     function normalizeAnswerText(answer) {
-        return cleanText(answer).toUpperCase().replace(/\s+/g, '');
+        return cleanText(answerToPlainText(answer, '|')).toUpperCase().replace(/\s+/g, '');
     }
     function clamp(value, min, max) {
         return Math.min(Math.max(value, min), max);
@@ -373,6 +382,53 @@
         return { qid, type: qType.code, typeLabel: qType.label, stem, stemImageCount, stemImageSources, options, matching, block };
     }
 
+    function getBlankAnswerItems(questionOrBlock) {
+        const block = questionOrBlock?.block || questionOrBlock;
+        if (!block) return [];
+
+        const primaryItems = Array.from(block.querySelectorAll('.blankItemDiv'));
+        if (primaryItems.length > 0) return primaryItems;
+
+        const answerItems = Array.from(block.querySelectorAll('.stem_answer > .Answer'));
+        if (answerItems.length > 0) return answerItems;
+
+        const qid = questionOrBlock?.qid || block.dataset.liuliuHelperQid || cleanText(block.getAttribute('data') || '').replace(/^question/i, '');
+        const sizeInput = (qid && (
+            document.querySelector(`input[name="tiankongsize${qid}"]`) ||
+            block.querySelector(`input[name="tiankongsize${qid}"]`)
+        )) || block.querySelector('input[name^="tiankongsize"]');
+        const blankCount = Number(sizeInput?.value || 0);
+        if (blankCount > 1) {
+            const fallbackItems = Array.from(block.querySelectorAll('.stem_answer .Answer, .stem_answer .divText'));
+            if (fallbackItems.length >= blankCount) return fallbackItems.slice(0, blankCount);
+        }
+
+        return [];
+    }
+
+    function hasEditorContent(container) {
+        if (!container) return false;
+
+        const iframe = container.querySelector('.edui-editor iframe');
+        if (iframe) {
+            try {
+                const doc = iframe.contentDocument || iframe.contentWindow.document;
+                if (cleanText(doc?.body?.textContent || '')) return true;
+            } catch (_) {}
+        }
+
+        const textareas = Array.from(container.querySelectorAll('textarea'));
+        if (textareas.some(ta => cleanText(ta.value))) return true;
+
+        const inputs = Array.from(container.querySelectorAll('input[type="text"], input[type="search"]'));
+        if (inputs.some(input => cleanText(input.value))) return true;
+
+        const legacyMirror = container.querySelector('.InpDIV');
+        if (legacyMirror && cleanText(legacyMirror.textContent || '')) return true;
+
+        return false;
+    }
+
     function isQuestionAnswered(q) {
         if (!q) return false;
         if (q.type === 'matching') {
@@ -380,31 +436,11 @@
             return items.length > 0 && items.every(item => cleanText(item.select?.value || ''));
         }
         if (q.type === 'short' || q.type === 'blank') {
-            const blankItems = Array.from(q.block.querySelectorAll('.blankItemDiv'));
+            const blankItems = getBlankAnswerItems(q);
             if (q.type === 'blank' && blankItems.length > 1) {
-                return blankItems.every(item => {
-                    const iframe = item.querySelector('.edui-editor iframe');
-                    if (iframe) {
-                        try {
-                            const doc = iframe.contentDocument || iframe.contentWindow.document;
-                            if (cleanText(doc?.body?.textContent || '')) return true;
-                        } catch (_) {}
-                    }
-                    const ta = item.querySelector('textarea');
-                    if (ta && cleanText(ta.value)) return true;
-                    const mirror = item.querySelector('.InpDIV, .textDIV');
-                    return !!cleanText(mirror?.textContent || '');
-                });
+                return blankItems.every(item => hasEditorContent(item));
             }
-            const iframe = q.block.querySelector('.edui-editor iframe');
-            if (iframe) {
-                try {
-                    const doc = iframe.contentDocument || iframe.contentWindow.document;
-                    return !!cleanText(doc?.body?.textContent || '');
-                } catch (_) {}
-            }
-            const ta = q.block.querySelector('textarea');
-            return ta ? !!cleanText(ta.value) : false;
+            return hasEditorContent(q.block);
         }
         return q.options.filter(o => isSelected(o.node)).length > 0;
     }
@@ -581,8 +617,9 @@
 
     // --- Apply Answer ---
     function fillEditorContainer(container, answer, question, pageWindow) {
+        const plainAnswer = answerToPlainText(answer);
         const answerTextarea = container.querySelector('textarea[id^="answer"], textarea[name^="answer"], textarea');
-        const formattedAnswer = answer.replace(/\n/g, '<br/>');
+        const formattedAnswer = plainAnswer.replace(/\n/g, '<br/>');
         let filled = false;
 
         if (answerTextarea && typeof pageWindow.UE !== 'undefined') {
@@ -630,12 +667,12 @@
         }
 
         if (!filled && answerTextarea) {
-            answerTextarea.value = answer;
+            answerTextarea.value = plainAnswer;
             filled = true;
         }
 
         if (filled && answerTextarea) {
-            answerTextarea.value = answer;
+            answerTextarea.value = plainAnswer;
             answerTextarea.dispatchEvent(new Event('input', { bubbles: true }));
             answerTextarea.dispatchEvent(new Event('change', { bubbles: true }));
             try {
@@ -649,6 +686,12 @@
     }
 
     function splitBlankAnswers(answer, blankCount) {
+        if (Array.isArray(answer)) {
+            const values = answer.map(item => String(item ?? '').trim());
+            if (blankCount <= 1) return [values.join('\n').trim()];
+            if (values.length >= blankCount) return values.slice(0, blankCount);
+            throw new Error(`填空题答案数量不足，需要 ${blankCount} 个空`);
+        }
         const text = String(answer || '').replace(/<br\s*\/?>/gi, '\n').trim();
         if (blankCount <= 1) return [text];
 
@@ -736,7 +779,7 @@
             return Math.random() < 0.5 ? '对' : '错';
         }
         if (question.type === 'blank') {
-            const blankCount = question.block.querySelectorAll('.blankItemDiv').length || 1;
+            const blankCount = getBlankAnswerItems(question).length || 1;
             return Array.from({ length: blankCount }, (_, i) => `${i + 1}. ${randomToken(5)}`).join('\n');
         }
         return randomToken(8);
@@ -745,11 +788,12 @@
     function applyBlankAnswer(question, answer) {
         const block = question.block;
         const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-        const blankItems = Array.from(block.querySelectorAll('.blankItemDiv'));
+        const blankItems = getBlankAnswerItems(question);
         if (blankItems.length <= 1) {
-            if (!fillEditorContainer(block, answer, question, pageWindow))
+            const plainAnswer = answerToPlainText(answer);
+            if (!fillEditorContainer(block, plainAnswer, question, pageWindow))
                 throw new Error('填空题自动填入失败，请手动复制答案');
-            return answer.length > 20 ? answer.slice(0, 20) + '...' : answer;
+            return plainAnswer.length > 20 ? plainAnswer.slice(0, 20) + '...' : plainAnswer;
         }
 
         const parts = splitBlankAnswers(answer, blankItems.length);
@@ -764,9 +808,10 @@
 
     function applyShortAnswer(question, answer) {
         const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-        if (!fillEditorContainer(question.block, answer, question, pageWindow))
+        const plainAnswer = answerToPlainText(answer);
+        if (!fillEditorContainer(question.block, plainAnswer, question, pageWindow))
             throw new Error('简答题自动填入失败，请手动复制答案');
-        return answer.length > 20 ? answer.slice(0, 20) + '...' : answer;
+        return plainAnswer.length > 20 ? plainAnswer.slice(0, 20) + '...' : plainAnswer;
     }
 
     function parseMatchingAnswer(answer, question) {
@@ -859,14 +904,15 @@
             return applyShortAnswer(question, answer);
         }
 
+        const plainAnswer = answerToPlainText(answer);
         if (question.type === 'judge') {
             let want = '';
-            const ansUpper = answer.toUpperCase();
+            const ansUpper = plainAnswer.toUpperCase();
             // 【Bug修复 1】增加边界控制，排除”是否/能否”等复合词干扰，”是””否”仅精确匹配
-            const judgeClean = answer.replace(/是否|能否|可否|与否/g, '').trim();
-            if (/(对|正确)/.test(judgeClean) || /^是$/.test(judgeClean) || /\b(YES|TRUE|T)\b/i.test(answer) || ansUpper === 'A') {
+            const judgeClean = plainAnswer.replace(/是否|能否|可否|与否/g, '').trim();
+            if (/(对|正确)/.test(judgeClean) || /^是$/.test(judgeClean) || /\b(YES|TRUE|T)\b/i.test(plainAnswer) || ansUpper === 'A') {
                 want = '对';
-            } else if (/(错|错误)/.test(judgeClean) || /^否$/.test(judgeClean) || /\b(NO|FALSE|F)\b/i.test(answer) || ansUpper === 'B') {
+            } else if (/(错|错误)/.test(judgeClean) || /^否$/.test(judgeClean) || /\b(NO|FALSE|F)\b/i.test(plainAnswer) || ansUpper === 'B') {
                 want = '错';
             }
 
@@ -885,13 +931,13 @@
         }
 
         // 【Bug修复 2】单/多选答案字母提取策略：提取所有独立的大写字母，合并去重排序
-        const allLetterMatches = answer.match(/\b[A-F]\b/gi);
+        const allLetterMatches = plainAnswer.match(/\b[A-F]\b/gi);
         let letters = '';
         if (allLetterMatches) {
             letters = [...new Set(allLetterMatches.map(c => c.toUpperCase()))].sort().join('');
         } else {
             // 退化处理：只保留A-F，避免提取出 THE 等长句里包含的不相干字母
-            letters = answer.toUpperCase().replace(/[^A-F]/g, '');
+            letters = plainAnswer.toUpperCase().replace(/[^A-F]/g, '');
         }
 
         if (!letters) throw new Error('答案中未找到有效的选项字母');
