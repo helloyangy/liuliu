@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通六六助手
 // @namespace    xuexitong-liuliu-helper
-// @version      3.3.7
-// @description  学习通专属AI助手，支持一键答题、自动解析，安全稳定。修复填空题答案识别与多空回填问题，增强简答题和数组答案兼容性。
+// @version      3.3.8
+// @description  学习通专属AI助手，支持一键答题、自动解析，安全稳定。优化性能与代码结构：缓存签名/填空项、消除重复解析、策略模式重构、XSS彻底消除。
 // @author       You
 // @icon         data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23d92d27'/%3E%3Cpath d='M18 16h30l-11 10h10L27 48h12L22 32h11L18 16z' fill='%23fff'/%3E%3C/svg%3E
 // @match        *://*.chaoxing.com/*
@@ -67,6 +67,7 @@
             'For single choice: answer is a single letter like A.',
             'For multiple choice: answer is letters like AC.',
             'For true/false: answer is 对 or 错.',
+            'For fill-in-the-blank with multiple blanks: answer must be a JSON array of strings in blank order.',
             'For matching questions: answer is pairs like 1-A,2-C,3-B.',
             'For short/essay: put the full answer text in the answer field.',
             'Keep explanation concise, under 50 words.'
@@ -241,7 +242,11 @@
     function hasQuestionBlocks() {
         return document.querySelector('.questionLi, .Zy_ulTk, .singleQuesId') !== null;
     }
+    let _cachedQuestionWindows = null;
+    let _cachedQuestionWindowsAt = 0;
     function collectQuestionWindows(rootWindow) {
+        const now = Date.now();
+        if (_cachedQuestionWindows && now - _cachedQuestionWindowsAt < 2000) return _cachedQuestionWindows;
         const found = [];
         const visited = new Set();
         const walk = (win) => {
@@ -258,6 +263,8 @@
             }
         };
         walk(rootWindow);
+        _cachedQuestionWindows = found;
+        _cachedQuestionWindowsAt = now;
         return found;
     }
 
@@ -379,10 +386,15 @@
         ));
         const options = optionNodes.map(parseOptionNode).filter(o => o.text.length > 0);
         const matching = qType.code === 'matching' ? parseMatchingQuestion(block) : null;
-        return { qid, type: qType.code, typeLabel: qType.label, stem, stemImageCount, stemImageSources, options, matching, block };
+        const result = { qid, type: qType.code, typeLabel: qType.label, stem, stemImageCount, stemImageSources, options, matching, block };
+        if (qType.code === 'blank' || qType.code === 'short') {
+            result._blankItems = getBlankAnswerItems(result);
+        }
+        return result;
     }
 
     function getBlankAnswerItems(questionOrBlock) {
+        if (questionOrBlock?._blankItems) return questionOrBlock._blankItems;
         const block = questionOrBlock?.block || questionOrBlock;
         if (!block) return [];
 
@@ -446,19 +458,15 @@
     }
 
     function getCurrentBlock() {
-        const visible = getQuestionBlocks().filter(el => {
-            const r = el.getBoundingClientRect();
+        const blocks = getQuestionBlocks();
+        const parsed = blocks.map(b => ({ block: b, q: parseQuestion(b) }))
+            .filter(({ q }) => q && !isQuestionAnswered(q));
+        if (parsed.length === 0) return null;
+        const visible = parsed.find(({ block }) => {
+            const r = block.getBoundingClientRect();
             return r.height > 0 && r.bottom > 0 && r.top < window.innerHeight;
         });
-        for (const item of visible) {
-            const q = parseQuestion(item);
-            if (q && !isQuestionAnswered(q)) return item;
-        }
-        for (const item of getQuestionBlocks()) {
-            const q = parseQuestion(item);
-            if (q && !isQuestionAnswered(q)) return item;
-        }
-        return null;
+        return visible ? visible.block : parsed[0].block;
     }
 
     function scrollToNextUnanswered() {
@@ -486,6 +494,14 @@
             lines.push('Answer format: 1-A,2-B,3-C');
             return lines.join('\n');
         }
+        if (question.type === 'blank') {
+            const blankCount = getBlankAnswerItems(question).length || 1;
+            lines.push(`Blank count: ${blankCount}`);
+            if (blankCount > 1) {
+                lines.push(`Answer format: JSON array with ${blankCount} strings, in blank order`);
+                lines.push('Example: ["first blank", "second blank"]');
+            }
+        }
         if (question.options.length > 0) {
             lines.push('Options:');
             lines.push(question.options.map(o => `${o.key || '?'}: ${o.text}`).join('\n'));
@@ -493,7 +509,8 @@
         return lines.join('\n');
     }
     function buildQuestionSignature(question) {
-        return JSON.stringify({
+        if (question._sig) return question._sig;
+        question._sig = JSON.stringify({
             type: question.type,
             stem: cleanText(question.stem),
             stemImageCount: Number(question.stemImageCount) || 0,
@@ -514,6 +531,7 @@
                 text: cleanText(o.text)
             }))
         });
+        return question._sig;
     }
     function stripControlChars(s) {
         return s.replace(/[\x00-\x1f]/g, ' ').replace(/ {2,}/g, ' ');
@@ -562,6 +580,41 @@
         const extracted = regexExtract(unwrapped);
         if (extracted) return extracted;
         throw new Error('模型返回不是有效 JSON');
+    }
+    function coerceStructuredAnswer(raw) {
+        if (Array.isArray(raw)) return raw;
+        const text = String(raw ?? '').trim();
+        if (!text) return raw;
+
+        if ((text.startsWith('[') && text.endsWith(']')) || (text.startsWith('{') && text.endsWith('}'))) {
+            try {
+                const parsed = JSON.parse(text);
+                if (Array.isArray(parsed)) return parsed;
+                if (parsed && typeof parsed === 'object') {
+                    if (Array.isArray(parsed.answer)) return parsed.answer;
+                    if (Array.isArray(parsed.answers)) return parsed.answers;
+                }
+            } catch (_) {}
+        }
+        return raw;
+    }
+    function normalizeModelResult(question, result) {
+        const normalized = (result && typeof result === 'object' && !Array.isArray(result))
+            ? { ...result }
+            : { answer: result, explanation: '', confidence: 0 };
+
+        if ((normalized.answer == null || normalized.answer === '') && Array.isArray(normalized.answers)) {
+            normalized.answer = normalized.answers;
+        }
+        normalized.answer = coerceStructuredAnswer(normalized.answer);
+
+        if (question?.type === 'blank') {
+            const blankCount = getBlankAnswerItems(question).length || 1;
+            if (blankCount > 1 && Array.isArray(normalized.answer)) {
+                normalized.answer = normalized.answer.map(item => String(item ?? '').trim());
+            }
+        }
+        return normalized;
     }
     function buildUserMessageContent(question) {
         const textPrompt = buildUserPrompt(question);
@@ -620,38 +673,39 @@
         const plainAnswer = answerToPlainText(answer);
         const answerTextarea = container.querySelector('textarea[id^="answer"], textarea[name^="answer"], textarea');
         const formattedAnswer = plainAnswer.replace(/\n/g, '<br/>');
-        let filled = false;
 
-        if (answerTextarea && typeof pageWindow.UE !== 'undefined') {
-            try {
-                const inst = pageWindow.UE.getEditor(answerTextarea.id);
-                if (inst?.setContent) {
-                    inst.setContent(formattedAnswer);
-                    inst.fireEvent?.('contentChange');
-                    filled = true;
-                }
-            } catch (_) {}
-        }
-
-        if (!filled && typeof pageWindow.UE !== 'undefined' && pageWindow.UE.instants) {
-            try {
-                for (const key in pageWindow.UE.instants) {
-                    const inst = pageWindow.UE.instants[key];
-                    if (!inst?.setContent) continue;
-                    const el = typeof inst.container === 'string' ? document.getElementById(inst.container) : inst.container;
-                    if (el && container.contains(el)) {
+        const strategies = [
+            () => {
+                if (!answerTextarea || typeof pageWindow.UE === 'undefined') return false;
+                try {
+                    const inst = pageWindow.UE.getEditor(answerTextarea.id);
+                    if (inst?.setContent) {
                         inst.setContent(formattedAnswer);
                         inst.fireEvent?.('contentChange');
-                        filled = true;
-                        break;
+                        return true;
                     }
-                }
-            } catch (_) {}
-        }
-
-        if (!filled) {
-            const iframe = container.querySelector('.edui-editor iframe');
-            if (iframe) {
+                } catch (_) {}
+                return false;
+            },
+            () => {
+                if (typeof pageWindow.UE === 'undefined' || !pageWindow.UE.instants) return false;
+                try {
+                    for (const key in pageWindow.UE.instants) {
+                        const inst = pageWindow.UE.instants[key];
+                        if (!inst?.setContent) continue;
+                        const el = typeof inst.container === 'string' ? document.getElementById(inst.container) : inst.container;
+                        if (el && container.contains(el)) {
+                            inst.setContent(formattedAnswer);
+                            inst.fireEvent?.('contentChange');
+                            return true;
+                        }
+                    }
+                } catch (_) {}
+                return false;
+            },
+            () => {
+                const iframe = container.querySelector('.edui-editor iframe');
+                if (!iframe) return false;
                 try {
                     const doc = iframe.contentDocument || iframe.contentWindow.document;
                     if (doc?.body) {
@@ -660,16 +714,19 @@
                             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
                             .replace(/\x00BR\x00/g, '<br/>');
                         doc.body.innerHTML = safeHtml;
-                        filled = true;
+                        return true;
                     }
                 } catch (_) {}
+                return false;
+            },
+            () => {
+                if (!answerTextarea) return false;
+                answerTextarea.value = plainAnswer;
+                return true;
             }
-        }
+        ];
 
-        if (!filled && answerTextarea) {
-            answerTextarea.value = plainAnswer;
-            filled = true;
-        }
+        const filled = strategies.some(fn => fn());
 
         if (filled && answerTextarea) {
             answerTextarea.value = plainAnswer;
@@ -695,35 +752,40 @@
         const text = String(answer || '').replace(/<br\s*\/?>/gi, '\n').trim();
         if (blankCount <= 1) return [text];
 
-        const numbered = [];
-        const re = /(?:^|[\s\n,;；，])(\d+)\s*[\.\):：、）]?\s*([\s\S]*?)(?=(?:[\s\n,;；，]+\d+\s*[\.\):：、）]?\s*)|$)/g;
-        let match;
-        while ((match = re.exec(text))) {
-            if (match[0].length === 0) { re.lastIndex++; if (re.lastIndex > text.length) break; continue; }
-            numbered.push({
-                index: Number(match[1]),
-                value: cleanText(match[2]).replace(/^[-=]+|[-=]+$/g, '').trim()
-            });
-        }
-        if (numbered.length >= blankCount) {
-            const values = numbered
-                .sort((a, b) => a.index - b.index)
-                .slice(0, blankCount)
-                .map(item => item.value);
-            if (values.every(Boolean)) return values;
-        }
+        const stripPrefix = v => v.replace(/^\d+\s*[\.\):：、）]\s*/, '').trim();
 
-        const lines = text.split(/\r?\n+/).map(v => cleanText(v)).filter(Boolean);
-        if (lines.length === blankCount) {
-            return lines.map(v => v.replace(/^\d+\s*[\.\):：、）]\s*/, '').trim());
-        }
+        const strategies = [
+            () => {
+                const numbered = [];
+                const re = /(?:^|[\s\n,;；，])(\d+)\s*[\.\):：、）]?\s*([\s\S]*?)(?=(?:[\s\n,;；，]+\d+\s*[\.\):：、）]?\s*)|$)/g;
+                let match;
+                while ((match = re.exec(text))) {
+                    if (match[0].length === 0) { re.lastIndex++; if (re.lastIndex > text.length) break; continue; }
+                    numbered.push({ index: Number(match[1]), value: cleanText(match[2]).replace(/^[-=]+|[-=]+$/g, '').trim() });
+                }
+                if (numbered.length >= blankCount) {
+                    const values = numbered.sort((a, b) => a.index - b.index).slice(0, blankCount).map(item => item.value);
+                    if (values.every(Boolean)) return values;
+                }
+                return null;
+            },
+            () => {
+                const lines = text.split(/\r?\n+/).map(v => cleanText(v)).filter(Boolean);
+                if (lines.length === blankCount) return lines.map(stripPrefix);
+                const stripped = lines.map(stripPrefix).filter(Boolean);
+                if (stripped.length === blankCount) return stripped;
+                return null;
+            },
+            () => {
+                const parts = text.split(/[;；,，]/).map(v => cleanText(v)).filter(Boolean);
+                if (parts.length === blankCount) return parts.map(stripPrefix);
+                return null;
+            }
+        ];
 
-        const numberedLines = lines.map(v => v.replace(/^\d+\s*[\.\):：、）]\s*/, '').trim()).filter(Boolean);
-        if (numberedLines.length === blankCount) return numberedLines;
-
-        const parts = text.split(/[;；,，]/).map(v => cleanText(v)).filter(Boolean);
-        if (parts.length === blankCount) {
-            return parts.map(v => v.replace(/^\d+\s*[\.\):：、）]\s*/, '').trim());
+        for (const fn of strategies) {
+            const result = fn();
+            if (result) return result;
         }
 
         throw new Error(`填空题答案无法自动拆分，需要 ${blankCount} 个空`);
@@ -1017,7 +1079,7 @@
                             return;
                         }
                         const content = data.choices?.[0]?.message?.content || '';
-                        finish(resolve, parseModelJson(content));
+                        finish(resolve, normalizeModelResult(question, parseModelJson(content)));
                     } catch (e) {
                         finish(reject, new Error('解析 API 响应失败: ' + e.message));
                     }
@@ -1303,9 +1365,12 @@
             lastLoggedAt = now;
             const row = uiDoc.createElement('div');
             const time = new Date().toLocaleTimeString('en-GB', { hour12: false });
-            // 【Bug修复 3】使用 textContent 安全渲染信息，防范 HTML 注入（XSS）
-            row.innerHTML = `<span style="opacity:0.5;margin-right:4px">[${time}]</span><span class="log-text"></span>`;
-            row.querySelector('.log-text').textContent = msg;
+            const timeSpan = uiDoc.createElement('span');
+            timeSpan.style.cssText = 'opacity:0.5;margin-right:4px';
+            timeSpan.textContent = `[${time}]`;
+            const msgSpan = uiDoc.createElement('span');
+            msgSpan.textContent = msg;
+            row.append(timeSpan, msgSpan);
             row.style.color = type === 'error' ? '#ef4444' : type === 'success' ? '#10b981' : '#475569';
             logContainer.appendChild(row);
             logContainer.scrollTop = logContainer.scrollHeight;
@@ -1504,7 +1569,8 @@
             isProcessingCurrent = true;
             try {
                 await processCurrent();
-            } catch (_) {
+            } catch (e) {
+                addLog(`处理异常: ${e.message}`, 'error');
             } finally {
                 isProcessingCurrent = false;
                 if (config.autoAnalyze) scheduleNextRun();
