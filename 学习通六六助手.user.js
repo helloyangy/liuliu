@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通六六助手
 // @namespace    xuexitong-liuliu-helper
-// @version      3.3.8
-// @description  学习通专属AI助手，支持一键答题、自动解析，安全稳定。优化性能与代码结构：缓存签名/填空项、消除重复解析、策略模式重构、XSS彻底消除。
+// @version      3.3.9
+// @description  学习通专属AI助手，支持一键答题、自动解析，安全稳定。修复重试机制：主动调度重试、最大重试次数限制、改进状态提示。
 // @author       You
 // @icon         data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23d92d27'/%3E%3Cpath d='M18 16h30l-11 10h10L27 48h12L22 32h11L18 16z' fill='%23fff'/%3E%3C/svg%3E
 // @match        *://*.chaoxing.com/*
@@ -69,8 +69,8 @@
             'For true/false: answer is 对 or 错.',
             'For fill-in-the-blank with multiple blanks: answer must be a JSON array of strings in blank order.',
             'For matching questions: answer is pairs like 1-A,2-C,3-B.',
-            'For short/essay: put the full answer text in the answer field.',
-            'Keep explanation concise, under 50 words.'
+            'For short/essay/calculation: put the full answer text in the answer field. Show key calculation steps in explanation.',
+            'Keep explanation concise, under 100 words for calculation questions, under 50 words for others.'
         ].join(' ')
     };
 
@@ -655,6 +655,10 @@
     function recordRetryFailure(signature, error) {
         const prev = getRetryState(signature);
         const nextCount = prev.count + 1;
+        if (nextCount > 5) {
+            retryStateBySig.delete(signature);
+            return { count: nextCount, nextAt: Infinity, lastMessage: String(error?.message || '') };
+        }
         const baseDelay = /503|unavailable|upstream provider error|timeout|network/i.test(String(error?.message || ''))
             ? 5000
             : 2000;
@@ -793,6 +797,8 @@
 
     function isImageOnlyQuestion(question) {
         if (!question) return false;
+        const hasText = cleanText(question.stem).length > 0;
+        if (hasText) return false;
         const hasStemImages = Number(question.stemImageCount) > 0;
         const hasMatchingImages = !!question.matching?.sourceItems?.some(item => (item.imageSources || []).length > 0);
         return hasStemImages || hasMatchingImages;
@@ -972,7 +978,7 @@
             const ansUpper = plainAnswer.toUpperCase();
             // 【Bug修复 1】增加边界控制，排除”是否/能否”等复合词干扰，”是””否”仅精确匹配
             const judgeClean = plainAnswer.replace(/是否|能否|可否|与否/g, '').trim();
-            if (/(对|正确)/.test(judgeClean) || /^是$/.test(judgeClean) || /\b(YES|TRUE|T)\b/i.test(plainAnswer) || ansUpper === 'A') {
+            if (/(?:^|[^不绝相针])(对|正确)/.test(judgeClean) || /^是$/.test(judgeClean) || /\b(YES|TRUE|T)\b/i.test(plainAnswer) || ansUpper === 'A') {
                 want = '对';
             } else if (/(错|错误)/.test(judgeClean) || /^否$/.test(judgeClean) || /\b(NO|FALSE|F)\b/i.test(plainAnswer) || ansUpper === 'B') {
                 want = '错';
@@ -985,8 +991,14 @@
                 if (want === '对' && /(对|正确|true|right|yes)/i.test(o.text)) { target = o; break; }
                 if (want === '错' && /(错|错误|false|wrong|no)/i.test(o.text)) { target = o; break; }
             }
-            if (!target && question.options.length >= 2)
-                target = want === '对' ? question.options[0] : question.options[1];
+            if (!target && question.options.length >= 2) {
+                const opt0 = cleanText(question.options[0].text);
+                const opt1 = cleanText(question.options[1].text);
+                const opt0IsWrong = /(错|错误|false|wrong|no)/i.test(opt0);
+                const opt1IsWrong = /(错|错误|false|wrong|no)/i.test(opt1);
+                if (want === '对') target = opt0IsWrong ? question.options[1] : question.options[0];
+                else target = opt1IsWrong ? question.options[0] : question.options[1];
+            }
             if (!target) throw new Error('未找到判断题选项');
             if (!isSelected(target.node)) clickNode(target.node);
             return want;
@@ -1044,6 +1056,7 @@
             });
 
             const timeoutMs = Math.max(1000, Number(config.timeoutMs) || 45000);
+            const effectiveTimeout = (question.type === 'short') ? Math.max(timeoutMs, 90000) : timeoutMs;
             let settled = false;
             let req = null;
             const finish = (fn, value) => {
@@ -1055,12 +1068,12 @@
             const tid = setTimeout(() => {
                 try { req?.abort?.(); } catch (_) {}
                 finish(reject, new Error('请求超时'));
-            }, timeoutMs + 1000);
+            }, effectiveTimeout + 1000);
 
             req = GM_xmlhttpRequest({
                 method: 'POST',
                 url: config.baseUrl.replace(/\/$/, '') + '/chat/completions',
-                timeout: timeoutMs,
+                timeout: effectiveTimeout,
                 headers: {
                     'Content-Type': 'application/json',
                     'Authorization': 'Bearer ' + config.apiKey
@@ -1086,8 +1099,8 @@
                 },
                 onerror() { finish(reject, new Error('网络请求失败')); },
                 ontimeout() {
-                    try { req?.abort?.(); } catch (_) {}
                     finish(reject, new Error('请求超时'));
+                    try { req?.abort?.(); } catch (_) {}
                 }
             });
         });
@@ -1461,22 +1474,27 @@
             const block = getCurrentBlock();
             if (!block) {
                 updateStatus('未检测到未答题目或已做完', 'normal', { skipLog: true });
-                return;
+                return false;
             }
             const q = parseQuestion(block);
-            if (!q) { updateStatus('题目解析失败或内容为空'); return; }
+            if (!q) { updateStatus('题目解析失败或内容为空'); return false; }
             if (isQuestionAnswered(q)) {
                 updateStatus('当前题目已作答，继续查找下一题', 'normal', { skipLog: true });
-                return;
+                return false;
             }
-            if (processingQids.has(q.qid)) return;
+            if (processingQids.has(q.qid)) return false;
 
             const signature = buildQuestionSignature(q);
             const retryState = getRetryState(signature);
+            if (retryState.nextAt === Infinity) {
+                updateStatus(`当前题已重试 ${retryState.count} 次仍失败，跳过`, 'error');
+                return false;
+            }
             if (retryState.nextAt > Date.now()) {
                 const waitSec = Math.max(1, Math.ceil((retryState.nextAt - Date.now()) / 1000));
-                updateStatus(`接口异常，${waitSec}s 后重试当前题`, 'error', { skipLog: true });
-                return;
+                updateStatus(`等待重试中，${waitSec}s 后重试`, 'error', { skipLog: true });
+                scheduleNextRun(retryState.nextAt - Date.now() + 200);
+                return true;
             }
 
             if (cacheBySig.has(signature)) {
@@ -1492,7 +1510,7 @@
                     updateStatus(`建议答案: ${cached.answer}`, 'success');
                     if (cached.explanation) addLog(`解析: ${shortText(cached.explanation, 60)}`, 'info');
                 }
-                return;
+                return false;
             }
 
             if (config.randomImageFallback && isImageOnlyQuestion(q)) {
@@ -1510,12 +1528,12 @@
                 } else {
                     updateStatus(`图片题随机答案: ${randomAnswer}`, 'success');
                 }
-                return;
+                return false;
             }
 
             if (!q.stem) {
                 updateStatus('题目缺少可解析文本', 'error');
-                return;
+                return false;
             }
 
             updateStatus(`正在思考第 ${q.qid} 题...`, 'normal', { skipLog: true });
@@ -1524,7 +1542,7 @@
 
             try {
                 const result = await getOrAsk(q);
-                if (!config.autoAnalyze) return;
+                if (!config.autoAnalyze) return false;
                 clearRetryState(signature);
                 if (result.answer) {
                     if (config.autoSubmit) {
@@ -1545,11 +1563,19 @@
                 } else {
                     updateStatus('API 返回答案为空', 'error');
                 }
+                return false;
             } catch (e) {
-                if (!config.autoAnalyze) return;
+                if (!config.autoAnalyze) return false;
                 const nextRetry = recordRetryFailure(signature, e);
-                const waitSec = Math.max(1, Math.ceil((nextRetry.nextAt - Date.now()) / 1000));
-                updateStatus(`错误: ${e.message}，${waitSec}s 后重试`, 'error');
+                if (nextRetry.nextAt === Infinity) {
+                    updateStatus(`错误: ${e.message}，已达最大重试次数`, 'error');
+                    return false;
+                } else {
+                    const waitSec = Math.max(1, Math.ceil((nextRetry.nextAt - Date.now()) / 1000));
+                    updateStatus(`错误: ${e.message}，${waitSec}s 后重试 (${nextRetry.count}/5)`, 'error');
+                    scheduleNextRun(nextRetry.nextAt - Date.now() + 200);
+                    return true;
+                }
             } finally {
                 processingQids.delete(q.qid);
             }
@@ -1568,12 +1594,13 @@
             }
             isProcessingCurrent = true;
             try {
-                await processCurrent();
+                const selfScheduled = await processCurrent();
+                if (config.autoAnalyze && !selfScheduled) scheduleNextRun();
             } catch (e) {
                 addLog(`处理异常: ${e.message}`, 'error');
+                if (config.autoAnalyze) scheduleNextRun();
             } finally {
                 isProcessingCurrent = false;
-                if (config.autoAnalyze) scheduleNextRun();
             }
         }
 
