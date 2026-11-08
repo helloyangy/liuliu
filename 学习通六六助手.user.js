@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通六六助手
 // @namespace    xuexitong-liuliu-helper
-// @version      3.3.9
-// @description  学习通专属AI助手，支持一键答题、自动解析，安全稳定。修复重试机制：主动调度重试、最大重试次数限制、改进状态提示。
+// @version      3.4.2
+// @description  学习通专属AI助手，支持一键答题、自动解析，安全稳定。新增图片答题：题干/选项/连线题图片采集、内嵌 base64 传输、视觉模型识别与失败降级；修复重试卡死与图片格式判定问题。
 // @author       You
 // @icon         data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23d92d27'/%3E%3Cpath d='M18 16h30l-11 10h10L27 48h12L22 32h11L18 16z' fill='%23fff'/%3E%3C/svg%3E
 // @match        *://*.chaoxing.com/*
@@ -42,17 +42,53 @@
             if (this.cache.size >= this.max) this.cache.delete(this.cache.keys().next().value);
             this.cache.set(key, val);
         }
+        delete(key) { return this.cache.delete(key); }
+        clear() { this.cache.clear(); }
     }
 
     const cacheBySig = new LRUCache(200);
     const inflightBySig = new Map();
     const retryStateBySig = new Map();
 
+    const LEGACY_SYSTEM_PROMPT = [
+        'You are a study assistant.',
+        'Return ONLY a valid JSON object with keys: answer, explanation, confidence.',
+        'For single choice: answer is a single letter like A.',
+        'For multiple choice: answer is letters like AC.',
+        'For true/false: answer is 对 or 错.',
+        'For fill-in-the-blank with multiple blanks: answer must be a JSON array of strings in blank order.',
+        'For matching questions: answer is pairs like 1-A,2-C,3-B.',
+        'For short/essay/calculation: put the full answer text in the answer field. Show key calculation steps in explanation.',
+        'Keep explanation concise, under 100 words for calculation questions, under 50 words for others.'
+    ].join(' ');
+
+    const SYSTEM_PROMPT = [
+        'You are a study assistant.',
+        'Return ONLY a valid JSON object with keys: answer, explanation, confidence.',
+        'For single choice: answer is a single letter like A.',
+        'For multiple choice: answer is letters like AC.',
+        'For true/false: answer is 对 or 错.',
+        'For fill-in-the-blank with multiple blanks: answer must be a JSON array of strings in blank order.',
+        'For matching questions: answer is pairs like 1-A,2-C,3-B.',
+        'For short/essay/calculation: put the full answer text in the answer field. Show key calculation steps in explanation.',
+        'If images are attached, read them before answering: OCR printed or handwritten text, formulas, tables, charts and diagrams, then solve using what you see.',
+        'Each attached image is preceded by a label such as "Option B image 1" that tells you where it appears; answer with the option letter, never the image label.',
+        'If a question has no machine-readable text, rely entirely on the attached images.',
+        'Never reply "cannot see the image" while images are attached.',
+        'Keep explanation concise, under 100 words for calculation questions, under 50 words for others.'
+    ].join(' ');
+
     const defaults = {
         enabled: true,
         baseUrl: 'https://api.openai.com/v1',
         apiKey: '',
         model: 'gpt-4o-mini',
+        visionEnabled: true,
+        visionModel: '',
+        imageMode: 'auto',
+        maxImages: 6,
+        compressImages: true,
+        imageMaxSide: 1600,
         temperature: 0.2,
         timeoutMs: 45000,
         autoAnalyze: true,
@@ -61,17 +97,7 @@
         scanIntervalMs: 1200,
         panelPos: null,
         launcherPos: null,
-        systemPrompt: [
-            'You are a study assistant.',
-            'Return ONLY a valid JSON object with keys: answer, explanation, confidence.',
-            'For single choice: answer is a single letter like A.',
-            'For multiple choice: answer is letters like AC.',
-            'For true/false: answer is 对 or 错.',
-            'For fill-in-the-blank with multiple blanks: answer must be a JSON array of strings in blank order.',
-            'For matching questions: answer is pairs like 1-A,2-C,3-B.',
-            'For short/essay/calculation: put the full answer text in the answer field. Show key calculation steps in explanation.',
-            'Keep explanation concise, under 100 words for calculation questions, under 50 words for others.'
-        ].join(' ')
+        systemPrompt: SYSTEM_PROMPT
     };
 
     // --- Config ---
@@ -84,13 +110,328 @@
     }
     function loadConfig() {
         const raw = gmGet(CFG_KEY, '');
-        if (!raw) return { ...defaults };
-        try { return { ...defaults, ...JSON.parse(raw) }; } catch (_) { return { ...defaults }; }
+        let loaded;
+        if (!raw) loaded = { ...defaults };
+        else {
+            try { loaded = { ...defaults, ...JSON.parse(raw) }; }
+            catch (_) { loaded = { ...defaults }; }
+        }
+        // 老版本没有图片答题提示词，静默升级；用户自定义过的提示词保持不动
+        if (!cleanText(loaded.systemPrompt) || loaded.systemPrompt === LEGACY_SYSTEM_PROMPT) {
+            loaded.systemPrompt = SYSTEM_PROMPT;
+        }
+        return loaded;
     }
     const config = loadConfig();
     function saveConfig(next) {
         Object.assign(config, next);
         gmSet(CFG_KEY, JSON.stringify(config));
+    }
+
+    // --- Image / vision helpers ---
+    let logSink = null;
+    function emitLog(msg, type = 'info') {
+        try { if (typeof logSink === 'function') logSink(msg, type); } catch (_) {}
+    }
+
+    // 去掉签名/时效参数，保证同一张图生成的题目签名稳定
+    function stableImageKey(url) {
+        const s = String(url || '');
+        if (s.startsWith('data:')) return `data:${s.length}:${s.slice(-32)}`;
+        try {
+            const u = new URL(s, location.href);
+            return u.origin + u.pathname;
+        } catch (_) {
+            return s.split('?')[0];
+        }
+    }
+
+    const IMAGE_URL_ATTRS = ['data-original', 'data-original-src', 'data-src', 'data-lazy-src', 'data-url', 'src'];
+    const DECORATIVE_IMAGE_RE = /(\/icons?\/|icon_|_icon\.|emoji|loading\.gif|blank\.gif|spacer|placeholder|1x1)/i;
+
+    function toAbsoluteUrl(raw, baseHref) {
+        const s = cleanText(raw);
+        if (!s) return '';
+        if (/^data:image\//i.test(s)) return s;
+        if (/^(blob:|about:|javascript:|chrome-extension:)/i.test(s)) return '';
+        try { return new URL(s, baseHref || document.baseURI || location.href).href; }
+        catch (_) { return ''; }
+    }
+
+    // 一个 img 可能同时挂着占位属性和真实地址，返回全部候选供调用方挑选
+    function pickImageUrls(img) {
+        const base = img.ownerDocument?.baseURI || document.baseURI;
+        const urls = [];
+        for (const attr of IMAGE_URL_ATTRS) {
+            const url = toAbsoluteUrl(img.getAttribute(attr), base);
+            if (url) urls.push(url);
+        }
+        const srcset = cleanText(img.getAttribute('srcset') || img.getAttribute('data-srcset') || '');
+        if (srcset) {
+            const url = toAbsoluteUrl(srcset.split(',')[0].trim().split(/\s+/)[0], base);
+            if (url) urls.push(url);
+        }
+        return urls;
+    }
+
+    function collectImageSources(root) {
+        if (!root) return [];
+        const nodes = String(root.tagName).toUpperCase() === 'IMG'
+            ? [root]
+            : Array.from(root.querySelectorAll('img'));
+        const found = [];
+        const seen = new Set();
+        nodes.forEach(img => {
+            const w = Number(img.getAttribute('width')) || 0;
+            const h = Number(img.getAttribute('height')) || 0;
+            const nw = Number(img.naturalWidth) || 0;
+            const nh = Number(img.naturalHeight) || 0;
+            // 只有节点本身就是装饰小图才整体跳过；占位 URL 应继续尝试该 img 的其它属性
+            if ((w > 0 && h > 0 && w <= 24 && h <= 24) ||
+                (nw > 0 && nh > 0 && nw <= 24 && nh <= 24)) return;
+            for (const url of pickImageUrls(img)) {
+                const isData = url.startsWith('data:');
+                if (isData && url.length < 200) continue; // 1x1 占位 data URL
+                if (!isData && DECORATIVE_IMAGE_RE.test(url)) continue;
+                const key = stableImageKey(url);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                found.push(url);
+                break;
+            }
+        });
+        return found;
+    }
+
+    const imageDataCache = new Map(); // url -> Promise<{ dataUrl, bytes }>
+
+    function arrayBufferToBase64(buffer) {
+        const bytes = new Uint8Array(buffer || 0);
+        let binary = '';
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+        }
+        return btoa(binary);
+    }
+
+    function guessImageMime(resp, url) {
+        const header = /content-type\s*:\s*([^\r\n;]+)/i.exec(String(resp?.responseHeaders || ''));
+        const fromHeader = cleanText(header?.[1] || '').toLowerCase();
+        const ext = (/\.(jpe?g|png|webp|gif|bmp)(?:\?|$)/i.exec(String(url || ''))?.[1] || '').toLowerCase();
+        const map = {
+            jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+            webp: 'image/webp', gif: 'image/gif', bmp: 'image/bmp'
+        };
+        // 响应头最权威：image/webp 配 .jpg 后缀也必须按 webp 处理
+        if (/^image\//.test(fromHeader)) return fromHeader;
+        // 防盗链常见 200 + HTML/JSON 拦截页，不能当成图片发给模型
+        if (/^(text\/|application\/(json|xml|javascript))/i.test(fromHeader)) return '';
+        return map[ext] || '';
+    }
+
+    // 校验实际字节，避免把防盗链的 HTML 拦截页当图片，也避免误拒无扩展名的合法图片
+    function sniffImageMime(bytes) {
+        if (!bytes || bytes.length < 4) return '';
+        if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
+        if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+        if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif';
+        if (bytes[0] === 0x42 && bytes[1] === 0x4d) return 'image/bmp';
+        if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+            bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return 'image/webp';
+        return '';
+    }
+
+    function fetchImageAsDataUrl(url) {
+        if (url.startsWith('data:')) {
+            const mime = (/^data:([^;,]+)/i.exec(url)?.[1] || '').toLowerCase();
+            if (!/^image\//.test(mime) || /svg/i.test(mime)) {
+                return Promise.reject(new Error('内嵌图片格式不受支持'));
+            }
+            return Promise.resolve({ dataUrl: url, bytes: Math.floor(url.length * 0.75) });
+        }
+        if (imageDataCache.has(url)) return imageDataCache.get(url);
+
+        const task = new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest !== 'function') {
+                reject(new Error('当前环境不支持跨域读取图片'));
+                return;
+            }
+            let req = null;
+            let done = false;
+            const timeoutMs = 12000;
+            const finish = (fn, value) => {
+                if (done) return;
+                done = true;
+                clearTimeout(tid);
+                fn(value);
+            };
+            const tid = setTimeout(() => {
+                try { req?.abort?.(); } catch (_) {}
+                finish(reject, new Error('图片读取超时'));
+            }, timeoutMs + 500);
+            try {
+                req = GM_xmlhttpRequest({
+                    method: 'GET',
+                    url,
+                    responseType: 'arraybuffer',
+                    timeout: timeoutMs,
+                    onload(resp) {
+                        try {
+                            if (resp.status < 200 || resp.status >= 300) {
+                                finish(reject, new Error(`图片 HTTP ${resp.status}`));
+                                return;
+                            }
+                            const buf = resp.response;
+                            if (!buf || !buf.byteLength) { finish(reject, new Error('图片内容为空')); return; }
+                            if (buf.byteLength > 6 * 1024 * 1024) { finish(reject, new Error('图片超过 6MB')); return; }
+                            const mime = sniffImageMime(new Uint8Array(buf)) || guessImageMime(resp, url);
+                            if (!mime) { finish(reject, new Error('图片响应不是图片内容')); return; }
+                            if (/svg/i.test(mime)) { finish(reject, new Error('暂不支持 SVG 图片')); return; }
+                            finish(resolve, {
+                                dataUrl: `data:${mime};base64,${arrayBufferToBase64(buf)}`,
+                                bytes: buf.byteLength
+                            });
+                        } catch (e) {
+                            finish(reject, new Error('图片解析失败: ' + e.message));
+                        }
+                    },
+                    onerror() { finish(reject, new Error('图片下载失败')); },
+                    ontimeout() {
+                        try { req?.abort?.(); } catch (_) {}
+                        finish(reject, new Error('图片下载超时'));
+                    }
+                });
+            } catch (e) {
+                finish(reject, new Error('图片请求异常: ' + e.message));
+            }
+        }).catch(err => {
+            imageDataCache.delete(url); // 失败不缓存，允许下一次重试
+            throw err;
+        });
+
+        imageDataCache.set(url, task);
+        if (imageDataCache.size > 80) imageDataCache.delete(imageDataCache.keys().next().value);
+        return task;
+    }
+
+    // 大尺寸截图先缩放并重编码，显著降低请求体积；白底避免透明图转 JPEG 后变黑
+    function compressDataUrl(dataUrl, maxSide) {
+        return new Promise(resolve => {
+            if (/^data:image\/gif/i.test(dataUrl)) { resolve(dataUrl); return; }
+            const img = new Image();
+            let settled = false;
+            const done = (value) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(value);
+            };
+            const timer = setTimeout(() => done(dataUrl), 4000);
+            img.onload = () => {
+                try {
+                    const w = img.naturalWidth || img.width;
+                    const h = img.naturalHeight || img.height;
+                    const scale = Math.min(1, maxSide / Math.max(w, h, 1));
+                    if (scale >= 1 && dataUrl.length < 1500000) { done(dataUrl); return; }
+                    const canvas = document.createElement('canvas');
+                    canvas.width = Math.max(1, Math.round(w * scale));
+                    canvas.height = Math.max(1, Math.round(h * scale));
+                    const ctx = canvas.getContext('2d');
+                    if (!ctx) { done(dataUrl); return; }
+                    ctx.fillStyle = '#ffffff';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    const out = canvas.toDataURL('image/jpeg', 0.82);
+                    done(out && out.length < dataUrl.length ? out : dataUrl);
+                } catch (_) { done(dataUrl); }
+            };
+            img.onerror = () => done(dataUrl);
+            img.src = dataUrl;
+        });
+    }
+
+    async function mapLimit(items, limit, mapper) {
+        const results = new Array(items.length);
+        let cursor = 0;
+        const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+            for (;;) {
+                const index = cursor++;
+                if (index >= items.length) return;
+                try { results[index] = await mapper(items[index], index); }
+                catch (err) { results[index] = { error: err }; }
+            }
+        });
+        await Promise.all(workers);
+        return results;
+    }
+
+    // 统一汇总一道题里所有图片，超限时按类别轮转，保证每类都还有代表
+    function collectImageParts(question) {
+        if (!question) return [];
+        const stemGroup = [], optionGroup = [], matchingGroup = [];
+        const push = (group, label, urls) => {
+            (urls || []).forEach((url, index) => {
+                if (url) group.push({ label: `${label} ${index + 1}`, url });
+            });
+        };
+        push(stemGroup, 'Question image', question.stemImageSources);
+        (question.options || []).forEach(option => push(optionGroup, `Option ${option.key || '?'} image`, option.imageSources));
+        if (question.type === 'matching' && question.matching) {
+            (question.matching.sourceItems || []).forEach(item => push(matchingGroup, `Group 1 item ${item.index} image`, item.imageSources));
+            (question.matching.targetItems || []).forEach(item => push(matchingGroup, `Group 2 item ${item.key} image`, item.imageSources));
+        }
+
+        const limit = clamp(Number(config.maxImages) || 6, 1, 12);
+        const total = stemGroup.length + optionGroup.length + matchingGroup.length;
+        if (total <= limit) return [...stemGroup, ...optionGroup, ...matchingGroup];
+
+        // 顺序硬截断会让题干截图把选项图全部挤掉，模型看不到选项却必须返回字母
+        const groups = [stemGroup, optionGroup, matchingGroup].filter(group => group.length > 0);
+        const picked = [];
+        for (let round = 0; picked.length < limit; round++) {
+            let added = false;
+            for (const group of groups) {
+                if (round >= group.length || picked.length >= limit) continue;
+                picked.push(group[round]);
+                added = true;
+            }
+            if (!added) break;
+        }
+        emitLog(`图片超过上限，按类别均衡保留 ${picked.length}/${total} 张`, 'info');
+        return picked;
+    }
+
+    function hasQuestionImages(question) {
+        return collectImageParts(question).length > 0;
+    }
+
+    async function prepareImageParts(parts) {
+        const mode = config.imageMode || 'auto';
+        if (mode === 'url') {
+            return parts
+                .filter(part => /^https?:\/\//i.test(part.url) || part.url.startsWith('data:'))
+                .map(part => ({ ...part, source: 'url' }));
+        }
+        const results = await mapLimit(parts, 3, async (part) => {
+            const loaded = await fetchImageAsDataUrl(part.url);
+            let dataUrl = loaded.dataUrl;
+            if (config.compressImages !== false) {
+                dataUrl = await compressDataUrl(dataUrl, clamp(Number(config.imageMaxSide) || 1600, 400, 3000));
+            }
+            return { ...part, url: dataUrl, source: 'base64' };
+        });
+        const out = [];
+        results.forEach((result, index) => {
+            if (result && !result.error) { out.push(result); return; }
+            if (mode === 'auto' && /^https?:\/\//i.test(parts[index].url)) {
+                out.push({ ...parts[index], source: 'url' });
+                emitLog(`图片 ${index + 1} 无法内嵌，改用原始链接`, 'info');
+            } else {
+                emitLog(`图片 ${index + 1} 已跳过: ${result?.error?.message || '读取失败'}`, 'error');
+            }
+        });
+        return out;
     }
 
     // --- Text helpers ---
@@ -276,9 +617,7 @@
             .filter(li => !li.classList.contains('groupTitile'))
             .map(li => {
                 const index = cleanText(li.querySelector('i')?.textContent || '').replace(/[^\d]/g, '');
-                const imageSources = Array.from(li.querySelectorAll('img'))
-                    .map(img => cleanText(img.getAttribute('data-original') || img.getAttribute('src') || ''))
-                    .filter(Boolean);
+                const imageSources = collectImageSources(li);
                 const text = cleanText(li.querySelector('p, a, div')?.textContent || li.textContent || '')
                     .replace(/^\d+[、.\s]*/, '')
                     .trim();
@@ -293,9 +632,10 @@
                 const text = cleanText(li.querySelector('p, a, div')?.textContent || li.textContent || '')
                     .replace(/^[A-Z][、.\s:]*/i, '')
                     .trim();
-                return { key, text };
+                const imageSources = collectImageSources(li);
+                return { key, text, imageSources };
             })
-            .filter(item => item.key && item.text);
+            .filter(item => item.key && (item.text || item.imageSources.length > 0));
 
         const answerItems = Array.from(matchingRoot.querySelectorAll('.lineOption')).map(item => {
             const index = cleanText(item.getAttribute('index') || item.querySelector('.matchNum')?.textContent || '').replace(/[^\d]/g, '');
@@ -341,7 +681,8 @@
         }
         const textNode = node.querySelector('.answer_p, p, .fl.answer_p, a.after, .after') || node;
         let text = cleanText(textNode.textContent || '').replace(/^([A-F])[.、\s:：]+/i, '').trim();
-        return { key, text, node };
+        const imageSources = collectImageSources(node);
+        return { key, text, imageSources, node };
     }
 
     function parseQuestion(block) {
@@ -376,15 +717,43 @@
         }
         const stemEl = block.querySelector('h3.mark_name, .mark_name') || findLegacyTitleNode(block);
         const stem = trimStemPrefix(stemEl ? stemEl.textContent : '');
-        const stemImages = stemEl ? Array.from(stemEl.querySelectorAll('img')) : [];
-        const stemImageCount = stemImages.length;
-        const stemImageSources = stemImages
-            .map(img => cleanText(img.getAttribute('data-original') || img.getAttribute('src') || ''))
-            .filter(Boolean);
+        // 题干图片常挂在标题节点、其父容器或 legacy 标题容器里，逐一补采并去重
+        const stemImageSources = [];
+        const seenStemImages = new Set();
+        const imageRoots = [stemEl];
+        const stemParent = stemEl?.parentElement;
+        if (stemParent && stemParent !== block &&
+            !stemParent.querySelector('.stem_answer, .answerList, .Zy_ulTop')) {
+            imageRoots.push(stemParent);
+        }
+        const legacyTitleRoot = block.querySelector('.Zy_TItle');
+        if (legacyTitleRoot) imageRoots.push(legacyTitleRoot);
+        imageRoots.forEach(root => {
+            collectImageSources(root).forEach(url => {
+                const key = stableImageKey(url);
+                if (seenStemImages.has(key)) return;
+                seenStemImages.add(key);
+                stemImageSources.push(url);
+            });
+        });
+        const stemImageCount = stemImageSources.length;
         const optionNodes = Array.from(block.querySelectorAll(
             '.stem_answer .answerBg, .stem_answer .clearfix.answerBg, .stem_answer .judgeoption, .answerList li, .Zy_ulTop li, li.before-after, li.before-after-checkbox'
         ));
-        const options = optionNodes.map(parseOptionNode).filter(o => o.text.length > 0);
+        const options = optionNodes.map(parseOptionNode)
+            .filter(o => o.text.length > 0 || o.imageSources.length > 0);
+        // 纯图片选项往往没有字母标记，按位置补齐，模型返回的字母才能落回 DOM
+        const usedKeys = new Set(options.filter(o => o.key).map(o => o.key));
+        options.forEach(option => {
+            if (option.key) return;
+            for (let i = 0; i < 26; i++) {
+                const candidate = String.fromCharCode(65 + i);
+                if (usedKeys.has(candidate)) continue;
+                option.key = candidate;
+                usedKeys.add(candidate);
+                break;
+            }
+        });
         const matching = qType.code === 'matching' ? parseMatchingQuestion(block) : null;
         const result = { qid, type: qType.code, typeLabel: qType.label, stem, stemImageCount, stemImageSources, options, matching, block };
         if (qType.code === 'blank' || qType.code === 'short') {
@@ -457,10 +826,19 @@
         return q.options.filter(o => isSelected(o.node)).length > 0;
     }
 
+    function isSkippedBlock(block) {
+        return block?.dataset?.liuliuHelperSkipped === '1';
+    }
+
+    // 重试已耗尽的题目必须退出候选，否则会一直占住「当前题」挡住后面的题
+    function isAbandonedQuestion(q) {
+        return !!q && getRetryState(buildQuestionSignature(q)).nextAt === Infinity;
+    }
+
     function getCurrentBlock() {
-        const blocks = getQuestionBlocks();
+        const blocks = getQuestionBlocks().filter(b => !isSkippedBlock(b));
         const parsed = blocks.map(b => ({ block: b, q: parseQuestion(b) }))
-            .filter(({ q }) => q && !isQuestionAnswered(q));
+            .filter(({ q }) => q && !isQuestionAnswered(q) && !isAbandonedQuestion(q));
         if (parsed.length === 0) return null;
         const visible = parsed.find(({ block }) => {
             const r = block.getBoundingClientRect();
@@ -471,8 +849,9 @@
 
     function scrollToNextUnanswered() {
         for (const item of getQuestionBlocks()) {
+            if (isSkippedBlock(item)) continue;
             const q = parseQuestion(item);
-            if (q && !isQuestionAnswered(q)) {
+            if (q && !isQuestionAnswered(q) && !isAbandonedQuestion(q)) {
                 item.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 return true;
             }
@@ -481,16 +860,23 @@
     }
 
     function buildUserPrompt(question) {
-        const lines = [`Type: ${question.typeLabel}`, `Question: ${question.stem}`];
+        const lines = [
+            `Type: ${question.typeLabel}`,
+            `Question: ${cleanText(question.stem) || '(no machine-readable text, see attached images)'}`
+        ];
         if (question.type === 'matching' && question.matching) {
             lines.push('Group 1:');
             lines.push(question.matching.sourceItems.map(item => {
-                const marker = item.text || '[image item]';
-                const imageHint = item.imageSources?.length ? ` (image count: ${item.imageSources.length})` : '';
+                const marker = item.text || '[image only]';
+                const imageHint = item.imageSources?.length ? ` (images: ${item.imageSources.length})` : '';
                 return `${item.index}: ${marker}${imageHint}`;
             }).join('\n'));
             lines.push('Group 2:');
-            lines.push(question.matching.targetItems.map(item => `${item.key}: ${item.text}`).join('\n'));
+            lines.push(question.matching.targetItems.map(item => {
+                const marker = item.text || '[image only]';
+                const imageHint = item.imageSources?.length ? ` (images: ${item.imageSources.length})` : '';
+                return `${item.key}: ${marker}${imageHint}`;
+            }).join('\n'));
             lines.push('Answer format: 1-A,2-B,3-C');
             return lines.join('\n');
         }
@@ -504,7 +890,11 @@
         }
         if (question.options.length > 0) {
             lines.push('Options:');
-            lines.push(question.options.map(o => `${o.key || '?'}: ${o.text}`).join('\n'));
+            lines.push(question.options.map(o => {
+                const marker = cleanText(o.text) || '[image only, see labelled option image]';
+                const imageHint = o.imageSources?.length ? ` (images: ${o.imageSources.length})` : '';
+                return `${o.key || '?'}: ${marker}${imageHint}`;
+            }).join('\n'));
         }
         return lines.join('\n');
     }
@@ -514,21 +904,23 @@
             type: question.type,
             stem: cleanText(question.stem),
             stemImageCount: Number(question.stemImageCount) || 0,
-            stemImageSources: Array.isArray(question.stemImageSources) ? question.stemImageSources : [],
+            stemImageSources: (Array.isArray(question.stemImageSources) ? question.stemImageSources : []).map(stableImageKey),
             matching: question.matching ? {
                 sourceItems: question.matching.sourceItems.map(item => ({
                     index: item.index,
                     text: cleanText(item.text),
-                    imageSources: Array.isArray(item.imageSources) ? item.imageSources : []
+                    imageSources: (item.imageSources || []).map(stableImageKey)
                 })),
                 targetItems: question.matching.targetItems.map(item => ({
                     key: item.key,
-                    text: cleanText(item.text)
+                    text: cleanText(item.text),
+                    imageSources: (item.imageSources || []).map(stableImageKey)
                 }))
             } : null,
             options: question.options.map(o => ({
                 key: o.key || '',
-                text: cleanText(o.text)
+                text: cleanText(o.text),
+                imageSources: (o.imageSources || []).map(stableImageKey)
             }))
         });
         return question._sig;
@@ -616,32 +1008,42 @@
         }
         return normalized;
     }
-    function buildUserMessageContent(question) {
+    async function buildUserMessageContent(question) {
         const textPrompt = buildUserPrompt(question);
-        const imageParts = [];
+        const imageParts = collectImageParts(question);
+        if (imageParts.length === 0) return { content: textPrompt, usedVision: false };
 
-        if (Array.isArray(question.stemImageSources)) {
-            question.stemImageSources.forEach((url, index) => {
-                if (url) imageParts.push({ label: `Question image ${index + 1}`, url });
-            });
-        }
-        if (question.type === 'matching' && question.matching?.sourceItems) {
-            question.matching.sourceItems.forEach(item => {
-                (item.imageSources || []).forEach((url, index) => {
-                    if (url) imageParts.push({ label: `Group 1 item ${item.index} image ${index + 1}`, url });
-                });
-            });
+        if (!config.visionEnabled) {
+            return {
+                content: textPrompt + '\nNote: this question has images, but image recognition is disabled. Answer from the available text only.',
+                usedVision: false,
+                degraded: true
+            };
         }
 
-        if (imageParts.length === 0) return textPrompt;
+        const prompt = textPrompt +
+            `\nImages attached: ${imageParts.length}. Read every attached image (OCR text, formulas, charts and diagrams) before answering.` +
+            '\nEach image is introduced by a label telling you exactly where it appears in the question.';
 
-        return [
-            { type: 'text', text: textPrompt },
-            ...imageParts.flatMap(item => ([
-                { type: 'text', text: item.label },
-                { type: 'image_url', image_url: { url: item.url } }
-            ]))
-        ];
+        emitLog(`正在读取题目图片 (${imageParts.length} 张)...`, 'info');
+        const prepared = await prepareImageParts(imageParts);
+        if (prepared.length === 0) {
+            emitLog('题目图片全部不可用', 'error');
+            return { content: prompt, usedVision: false, degraded: true };
+        }
+        const embedded = prepared.filter(part => part.source === 'base64').length;
+        emitLog(`图片就绪: ${embedded} 张内嵌 / ${prepared.length - embedded} 张外链`, 'info');
+
+        return {
+            content: [
+                { type: 'text', text: prompt },
+                ...prepared.flatMap(part => ([
+                    { type: 'text', text: part.label },
+                    { type: 'image_url', image_url: { url: part.url } }
+                ]))
+            ],
+            usedVision: true
+        };
     }
 
     function getRetryState(signature) {
@@ -656,8 +1058,14 @@
         const prev = getRetryState(signature);
         const nextCount = prev.count + 1;
         if (nextCount > 5) {
-            retryStateBySig.delete(signature);
-            return { count: nextCount, nextAt: Infinity, lastMessage: String(error?.message || '') };
+            // 必须把终态写回，否则下一轮 getRetryState 会回到 count=0 并无限重试
+            const terminal = {
+                count: nextCount,
+                nextAt: Infinity,
+                lastMessage: String(error?.message || '')
+            };
+            retryStateBySig.set(signature, terminal);
+            return terminal;
         }
         const baseDelay = /503|unavailable|upstream provider error|timeout|network/i.test(String(error?.message || ''))
             ? 5000
@@ -797,11 +1205,8 @@
 
     function isImageOnlyQuestion(question) {
         if (!question) return false;
-        const hasText = cleanText(question.stem).length > 0;
-        if (hasText) return false;
-        const hasStemImages = Number(question.stemImageCount) > 0;
-        const hasMatchingImages = !!question.matching?.sourceItems?.some(item => (item.imageSources || []).length > 0);
-        return hasStemImages || hasMatchingImages;
+        if (cleanText(question.stem).length > 0) return false;
+        return hasQuestionImages(question);
     }
 
     function randomChoice(list) {
@@ -1042,21 +1447,40 @@
     }
 
     // --- API Logic ---
-    function callOpenAI(question) {
-        return new Promise((resolve, reject) => {
-            if (!config.apiKey) { reject(new Error('API Key 未配置，请打开设置填写')); return; }
+    async function callOpenAI(question) {
+        if (!config.apiKey) throw new Error('API Key 未配置，请打开设置填写');
 
+        const built = await buildUserMessageContent(question);
+        if (built.degraded && isImageOnlyQuestion(question)) {
+            const err = new Error('题目图片无法读取，且题干没有可解析文本');
+            err.__skipRetry = true; // 纯图片题没有图就不必反复重试 API
+            throw err;
+        }
+
+        const visionModel = cleanText(config.visionModel);
+        const model = (built.usedVision && visionModel) ? visionModel : config.model;
+        if (built.usedVision && visionModel) emitLog(`视觉模型: ${visionModel}`, 'info');
+
+        // 老用户可能自定义过系统提示词，补上读图指令，避免模型忽略附图
+        let systemPrompt = config.systemPrompt || SYSTEM_PROMPT;
+        if (built.usedVision && !/image|图片|视觉/i.test(systemPrompt)) {
+            systemPrompt += ' Images are attached: read and OCR every image before answering, and never claim you cannot see them.';
+        }
+
+        return new Promise((resolve, reject) => {
             const body = JSON.stringify({
-                model: config.model,
+                model,
                 temperature: Number(config.temperature),
                 messages: [
-                    { role: 'system', content: config.systemPrompt },
-                    { role: 'user', content: buildUserMessageContent(question) }
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: built.content }
                 ]
             });
 
             const timeoutMs = Math.max(1000, Number(config.timeoutMs) || 45000);
-            const effectiveTimeout = (question.type === 'short') ? Math.max(timeoutMs, 90000) : timeoutMs;
+            const effectiveTimeout = (question.type === 'short' || built.usedVision)
+                ? Math.max(timeoutMs, 90000)
+                : timeoutMs;
             let settled = false;
             let req = null;
             const finish = (fn, value) => {
@@ -1126,6 +1550,19 @@
         el.placeholder = placeholder;
         el.value = value || '';
         el.style.cssText = 'width:100%;margin-bottom:6px;padding:7px;border:1px solid #cbd5e1;border-radius:10px;background:#f8fafc;color:#0f172a;outline:none;box-sizing:border-box;';
+        return el;
+    }
+
+    function createSelect(options, value) {
+        const el = getUIDocument().createElement('select');
+        options.forEach(([val, label]) => {
+            const opt = getUIDocument().createElement('option');
+            opt.value = val;
+            opt.textContent = label;
+            if (val === value) opt.selected = true;
+            el.appendChild(opt);
+        });
+        el.style.cssText = 'width:100%;margin-bottom:6px;padding:7px;border:1px solid #cbd5e1;border-radius:10px;background:#f8fafc;color:#0f172a;outline:none;box-sizing:border-box;font-size:12px;';
         return el;
     }
 
@@ -1249,35 +1686,59 @@
 
         // --- Settings Panel ---
         const settingsPanel = uiDoc.createElement('div');
-        settingsPanel.style.cssText = 'padding:0 16px 16px;display:none;border-top:1px solid #e2e8f0;padding-top:16px;';
+        settingsPanel.style.cssText = 'padding:0 16px 16px;display:none;border-top:1px solid #e2e8f0;padding-top:16px;max-height:70vh;overflow-y:auto;';
 
         const baseUrlInput = createInput('API 地址 (Base URL)', config.baseUrl);
         const apiKeyInput = createInput('API 密钥', config.apiKey, 'password');
         const modelInput = createInput('模型名称', config.model);
 
-        const autoSubmitRow = uiDoc.createElement('label');
-        autoSubmitRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer;font-size:12px;color:#475569;';
-        const autoSubmitCheck = uiDoc.createElement('input');
-        autoSubmitCheck.type = 'checkbox';
-        autoSubmitCheck.checked = !!config.autoSubmit;
-        const autoSubmitText = uiDoc.createElement('span');
-        autoSubmitText.textContent = '自动勾选答案';
-        autoSubmitRow.append(autoSubmitCheck, autoSubmitText);
+        function createCheckRow(text, checked) {
+            const row = uiDoc.createElement('label');
+            row.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-size:12px;color:#475569;';
+            const input = uiDoc.createElement('input');
+            input.type = 'checkbox';
+            input.checked = !!checked;
+            const label = uiDoc.createElement('span');
+            label.textContent = text;
+            row.append(input, label);
+            return { row, input };
+        }
+        function createSectionLabel(text) {
+            const el = uiDoc.createElement('div');
+            el.textContent = text;
+            el.style.cssText = 'font-size:11px;font-weight:600;color:#94a3b8;margin:12px 0 6px;letter-spacing:0.5px;';
+            return el;
+        }
 
-        const randomImageFallbackRow = uiDoc.createElement('label');
-        randomImageFallbackRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer;font-size:12px;color:#475569;';
-        const randomImageFallbackCheck = uiDoc.createElement('input');
-        randomImageFallbackCheck.type = 'checkbox';
-        randomImageFallbackCheck.checked = !!config.randomImageFallback;
-        const randomImageFallbackText = uiDoc.createElement('span');
-        randomImageFallbackText.textContent = '图片题无法识别时随机作答';
-        randomImageFallbackRow.append(randomImageFallbackCheck, randomImageFallbackText);
+        const autoSubmit = createCheckRow('自动勾选答案', config.autoSubmit);
+        const visionEnabled = createCheckRow('启用图片识别（需视觉模型）', config.visionEnabled);
+        const compressImages = createCheckRow('自动压缩大图', config.compressImages);
+        const randomImageFallback = createCheckRow('图片识别失败时随机作答', config.randomImageFallback);
+
+        const visionSection = createSectionLabel('图片答题');
+        const visionModelInput = createInput('视觉模型（留空则用主模型）', config.visionModel);
+        const imageModeSelect = createSelect([
+            ['auto', '自动：优先内嵌，失败回退直链'],
+            ['base64', '强制内嵌 base64（推荐）'],
+            ['url', '仅发送图片直链']
+        ], config.imageMode);
+        const maxImagesInput = createInput('单题最多图片数 (1-12)', String(config.maxImages || 6), 'number');
+        maxImagesInput.min = '1';
+        maxImagesInput.max = '12';
+        const imageMaxSideInput = createInput('图片最长边上限 px (400-3000)', String(config.imageMaxSide || 1600), 'number');
+        imageMaxSideInput.min = '400';
+        imageMaxSideInput.max = '3000';
 
         const saveBtn = createButton('保存并应用', '#3b82f6', '#ffffff');
         saveBtn.style.width = '100%';
         saveBtn.style.marginTop = '8px';
 
-        settingsPanel.append(baseUrlInput, apiKeyInput, modelInput, autoSubmitRow, randomImageFallbackRow, saveBtn);
+        settingsPanel.append(
+            baseUrlInput, apiKeyInput, modelInput, autoSubmit.row,
+            visionSection, visionEnabled.row, visionModelInput, imageModeSelect,
+            maxImagesInput, imageMaxSideInput, compressImages.row, randomImageFallback.row,
+            saveBtn
+        );
 
         // --- State ---
         let autoTimer = null;
@@ -1389,6 +1850,7 @@
             logContainer.scrollTop = logContainer.scrollHeight;
             while (logContainer.children.length > 50) logContainer.removeChild(logContainer.firstChild);
         }
+        logSink = addLog; // 让全局图片处理链路也能输出到面板日志
 
         function updateStatus(text, type = 'normal', options = {}) {
             const skipLog = !!options.skipLog;
@@ -1447,14 +1909,30 @@
         }
 
         function syncConfig() {
+            // 影响答案结果的配置一旦变化，必须让旧答案/旧图片缓存失效
+            const watched = ['baseUrl', 'apiKey', 'model', 'visionEnabled', 'visionModel', 'imageMode', 'maxImages', 'imageMaxSide', 'compressImages'];
+            const before = watched.map(key => config[key]);
             saveConfig({
                 baseUrl: cleanText(baseUrlInput.value),
                 apiKey: apiKeyInput.value.trim(),
                 model: cleanText(modelInput.value),
-                autoSubmit: !!autoSubmitCheck.checked,
-                randomImageFallback: !!randomImageFallbackCheck.checked,
+                visionEnabled: !!visionEnabled.input.checked,
+                visionModel: cleanText(visionModelInput.value),
+                imageMode: imageModeSelect.value,
+                maxImages: clamp(Number(maxImagesInput.value) || 6, 1, 12),
+                imageMaxSide: clamp(Number(imageMaxSideInput.value) || 1600, 400, 3000),
+                compressImages: !!compressImages.input.checked,
+                autoSubmit: !!autoSubmit.input.checked,
+                randomImageFallback: !!randomImageFallback.input.checked,
                 autoAnalyze: config.autoAnalyze
             });
+            if (watched.some((key, index) => config[key] !== before[index])) {
+                cacheBySig.clear();
+                retryStateBySig.clear();
+                imageDataCache.clear();
+                clearSkippedMarks();
+                addLog('模型/图片配置已变更，缓存已清空', 'info');
+            }
         }
 
         const didDragPanel = setupDraggable(panel, {
@@ -1470,6 +1948,40 @@
         });
 
         // --- Core processing loop ---
+        function clearSkippedMarks() {
+            getQuestionBlocks().forEach(block => {
+                try { delete block.dataset.liuliuHelperSkipped; } catch (_) {}
+            });
+        }
+
+        // 只有视觉识别不可用、或识别最终失败时才退化为随机作答
+        function applyImageRandomFallback(question, reason) {
+            let randomAnswer;
+            try {
+                randomAnswer = buildRandomAnswer(question);
+            } catch (err) {
+                updateStatus(`图片题随机作答失败: ${err.message}`, 'error');
+                return false;
+            }
+            // 不写入答案缓存：改配置后清除跳过标记，题目可以重新用视觉模型识别
+            if (config.autoSubmit && !hasAppliedAnswer(question, randomAnswer)) {
+                try {
+                    applySuggestedAnswer(question, randomAnswer);
+                    rememberAppliedAnswer(question, randomAnswer);
+                    updateStatus(`图片题已随机作答: ${randomAnswer}`, 'success');
+                    setTimeout(scrollToNextUnanswered, 800);
+                } catch (err) {
+                    updateStatus(`图片题随机作答失败: ${err.message}`, 'error');
+                }
+            } else {
+                updateStatus(`图片题随机答案: ${randomAnswer}`, 'success');
+            }
+            if (reason) addLog(`兜底原因: ${shortText(reason, 60)}`, 'info');
+            // 避免未开启自动勾选时，同一道图片题被反复扫描
+            try { question.block.dataset.liuliuHelperSkipped = '1'; } catch (_) {}
+            return false;
+        }
+
         async function processCurrent() {
             const block = getCurrentBlock();
             if (!block) {
@@ -1505,7 +2017,11 @@
                         rememberAppliedAnswer(q, cached.answer);
                         updateStatus(`已应用缓存答案: ${cached.answer}`, 'success');
                         setTimeout(scrollToNextUnanswered, 800);
-                    } catch (_) {}
+                    } catch (err) {
+                        updateStatus(`缓存答案应用失败: ${err.message}`, 'error');
+                        // DOM 不支持该题时不要每轮静默重试而卡住后面的题
+                        try { block.dataset.liuliuHelperSkipped = '1'; } catch (_) {}
+                    }
                 } else if (cached?.answer) {
                     updateStatus(`建议答案: ${cached.answer}`, 'success');
                     if (cached.explanation) addLog(`解析: ${shortText(cached.explanation, 60)}`, 'info');
@@ -1513,31 +2029,20 @@
                 return false;
             }
 
-            if (config.randomImageFallback && isImageOnlyQuestion(q)) {
-                const randomAnswer = buildRandomAnswer(q);
-                cacheBySig.set(signature, { answer: randomAnswer, explanation: '图片题缺少可解析文本，已启用随机作答。', confidence: 0 });
-                if (config.autoSubmit && !hasAppliedAnswer(q, randomAnswer)) {
-                    try {
-                        applySuggestedAnswer(q, randomAnswer);
-                        rememberAppliedAnswer(q, randomAnswer);
-                        updateStatus(`图片题已随机作答: ${randomAnswer}`, 'success');
-                        setTimeout(scrollToNextUnanswered, 800);
-                    } catch (err) {
-                        updateStatus(`图片题随机作答失败: ${err.message}`, 'error');
-                    }
-                } else {
-                    updateStatus(`图片题随机答案: ${randomAnswer}`, 'success');
-                }
-                return false;
+            // 只有在关闭视觉识别时，纯图片题才直接走原来的随机兜底
+            if (!config.visionEnabled && config.randomImageFallback && isImageOnlyQuestion(q)) {
+                return applyImageRandomFallback(q, '已关闭图片识别');
             }
 
-            if (!q.stem) {
+            if (!q.stem && !hasQuestionImages(q)) {
                 updateStatus('题目缺少可解析文本', 'error');
                 return false;
             }
 
-            updateStatus(`正在思考第 ${q.qid} 题...`, 'normal', { skipLog: true });
-            addLog(`题型: ${q.typeLabel} | QID: ${q.qid}`, 'info');
+            updateStatus(isImageOnlyQuestion(q)
+                ? `正在识别第 ${q.qid} 题的图片...`
+                : `正在思考第 ${q.qid} 题...`, 'normal', { skipLog: true });
+            addLog(`题型: ${q.typeLabel} | QID: ${q.qid}${hasQuestionImages(q) ? ' | 含图片' : ''}`, 'info');
             processingQids.add(q.qid);
 
             try {
@@ -1566,8 +2071,19 @@
                 return false;
             } catch (e) {
                 if (!config.autoAnalyze) return false;
+                if (e?.__skipRetry) {
+                    clearRetryState(signature);
+                    if (config.randomImageFallback && isImageOnlyQuestion(q)) {
+                        return applyImageRandomFallback(q, e.message);
+                    }
+                    updateStatus(e.message, 'error');
+                    return false;
+                }
                 const nextRetry = recordRetryFailure(signature, e);
                 if (nextRetry.nextAt === Infinity) {
+                    if (config.randomImageFallback && isImageOnlyQuestion(q)) {
+                        return applyImageRandomFallback(q, `识别失败: ${e.message}`);
+                    }
                     updateStatus(`错误: ${e.message}，已达最大重试次数`, 'error');
                     return false;
                 } else {
